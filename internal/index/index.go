@@ -128,7 +128,9 @@ func (ix *Index) prepare(root string, logf func(string, ...any)) error {
 // already on the way from root to it is not walked again. Only regular files are listed.
 //
 // An entry that cannot be walked is an error: the list would miss files without saying so. Only a broken symlink
-// whose name does not end in .php is skipped: what it pointed at, a file or a directory, cannot be known.
+// whose name does not end in .php is skipped: what it pointed at, a file or a directory, cannot be known. A symlink
+// is broken when its target does not exist or its chain of symlinks does not end; any other error of following it
+// is an error.
 func phpFiles(root string, logf func(string, ...any)) ([]string, error) {
 	canonical, err := filepath.EvalSymlinks(root)
 	if err != nil {
@@ -191,7 +193,7 @@ func walkDir(dir, rel string, entries []fs.DirEntry, chain []string, paths *[]st
 // broken reports whether err, from following a symlink, says that the symlink leads nowhere: its target does not
 // exist or the chain of symlinks does not end.
 func broken(err error) bool {
-	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.ELOOP)
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ELOOP)
 }
 
 // errNotRegular is the error of reading a name that is not a regular file.

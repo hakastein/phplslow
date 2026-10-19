@@ -74,6 +74,10 @@ var unreadableEntries = []unreadable{
 		place{"src/lib/deep.php", "add('linked')"}, "permission denied"},
 	{"broken .php symlink", false, brokenPHPLink, "src/broken.php", place{"src/broken.php", "add('linked')"},
 		"no such file or directory"},
+	{"symlink through a regular file", false, linkThroughFile, "src/lib", place{"src/lib/deep.php", "add('linked')"},
+		"not a directory"},
+	{"symlink through a locked directory", true, linkThroughLockedDirectory, "src/lib",
+		place{"src/lib/deep.php", "add('linked')"}, "permission denied"},
 }
 
 // An entry the index cannot read fails the index: an answer without its calls would look complete.
@@ -205,6 +209,35 @@ func brokenPHPLink(t *testing.T, root string) (spoil, mend func()) {
 	write()
 	require.NoError(t, os.Symlink(target, filepath.Join(root, "src", "broken.php")))
 	return func() { require.NoError(t, os.Remove(target)) }, write
+}
+
+// linkThroughFile makes src/lib a symlink to afile/inner; spoiled, afile is a regular file, so the target is
+// neither there nor missing.
+func linkThroughFile(t *testing.T, root string) (spoil, mend func()) {
+	t.Helper()
+	afile := filepath.Join(t.TempDir(), "afile")
+	mend = func() {
+		require.NoError(t, os.RemoveAll(afile))
+		require.NoError(t, os.MkdirAll(filepath.Join(afile, "inner"), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(afile, "inner", "deep.php"), []byte(linkedCall), 0o600))
+	}
+	mend()
+	require.NoError(t, os.Symlink(filepath.Join(afile, "inner"), filepath.Join(root, "src", "lib")))
+	return func() {
+		require.NoError(t, os.RemoveAll(afile))
+		require.NoError(t, os.WriteFile(afile, nil, 0o600))
+	}, mend
+}
+
+// linkThroughLockedDirectory makes src/lib a symlink to locked/inner; spoiled, locked has mode 000, so the target
+// cannot be stat-ed.
+func linkThroughLockedDirectory(t *testing.T, root string) (spoil, mend func()) {
+	t.Helper()
+	locked := filepath.Join(t.TempDir(), "locked")
+	require.NoError(t, os.MkdirAll(filepath.Join(locked, "inner"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(locked, "inner", "deep.php"), []byte(linkedCall), 0o600))
+	require.NoError(t, os.Symlink(filepath.Join(locked, "inner"), filepath.Join(root, "src", "lib")))
+	return chmod(t, locked, 0, 0o755)
 }
 
 // Writing to stdout fails once the client has closed its end: the session ends instead of serving no one.

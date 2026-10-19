@@ -46,8 +46,10 @@ return types or PHPDoc. Other requests are answered with `MethodNotFound`.
   the link, and a directory already on the path from the root is not walked again. Only regular files are read.
 - Skipped on purpose, and only these: an entry that is not a regular file (a named pipe, a socket, a device), a
   directory already on the path from the root, and a broken symlink whose name does not end in `.php` (it is
-  logged to stderr). Any other entry that cannot be read fails the index: a directory that cannot be listed, an
-  entry that cannot be stat-ed, a `.php` file that cannot be opened or read, a broken `.php` symlink. Requests then
+  logged to stderr). A symlink is broken only when its target is missing or its chain of links never ends. Any
+  other entry that cannot be read fails the index: a directory that cannot be listed, an entry that cannot be
+  stat-ed (also a symlink whose target path runs through a regular file or a directory without permission), a
+  `.php` file that cannot be opened or read, a broken `.php` symlink. Requests then
   get `RequestFailed` with the path and the OS error, also when a ready index exists; once the cause is removed,
   the next start answers in full.
 - phplslow chooses where the index lives: one SQLite file per workspace root under the user's cache directory
