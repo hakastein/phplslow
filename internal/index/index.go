@@ -7,12 +7,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/ncruces/go-sqlite3"
 
@@ -50,8 +53,8 @@ type Index struct {
 	conn *sqlite3.Conn
 }
 
-// Path is the index file of root. phplslow chooses it: a directory per root under the user's cache directory.
-func Path(root string) (string, error) {
+// indexPath is the index file of root. phplslow chooses it: a directory per root under the user's cache directory.
+func indexPath(root string) (string, error) {
 	cache, err := os.UserCacheDir()
 	if err != nil {
 		return "", err
@@ -64,14 +67,14 @@ func Path(root string) (string, error) {
 // («path → hash») equals the files on disk is used as it is; otherwise the whole index is built again.
 // logf receives diagnostic lines; they are not a protocol.
 func Open(root string, logf func(format string, args ...any)) (*Index, error) {
-	path, err := Path(root)
+	file, err := indexPath(root)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
 		return nil, err
 	}
-	conn, err := sqlite3.Open(path)
+	conn, err := sqlite3.Open(file)
 	if err != nil {
 		return nil, err
 	}
@@ -119,32 +122,77 @@ func (ix *Index) prepare(root string, logf func(string, ...any)) error {
 	return nil
 }
 
-// phpFiles lists the .php files under root, relative, with forward slashes, sorted.
+// phpFiles lists the .php files under root, relative, with forward slashes, sorted. Symlinks are followed, to files
+// and to directories, also outside root; a file is named by its path through the symlink. A directory that is
+// already on the way from root to it is not walked again. Only regular files are listed.
 func phpFiles(root string, logf func(string, ...any)) ([]string, error) {
+	canonical, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
 	var paths []string
-	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			if p == root {
-				return err
-			}
-			logf("phplslow: skip %s: %v", p, err)
-			if d != nil && d.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		if d.IsDir() || !strings.HasSuffix(d.Name(), ".php") {
-			return nil
-		}
-		rel, err := filepath.Rel(root, p)
-		if err != nil {
-			return err
-		}
-		paths = append(paths, filepath.ToSlash(rel))
-		return nil
-	})
+	walkDir(root, "", entries, []string{canonical}, &paths, logf)
 	slices.Sort(paths)
-	return paths, err
+	return paths, nil
+}
+
+// walkDir lists the .php files of the directory dir, whose path relative to the root is rel; chain holds the
+// canonical paths of the directories from the root to dir.
+func walkDir(dir, rel string, entries []fs.DirEntry, chain []string, paths *[]string, logf func(string, ...any)) {
+	for _, e := range entries {
+		p, r := filepath.Join(dir, e.Name()), path.Join(rel, e.Name())
+		mode := e.Type()
+		if mode&fs.ModeSymlink != 0 {
+			info, err := os.Stat(p) // never opens the target: a named pipe does not block it
+			if err != nil {
+				logf("phplslow: skip %s: %v", p, err)
+				continue
+			}
+			mode = info.Mode().Type()
+		}
+		switch {
+		case mode.IsDir():
+			canonical, err := filepath.EvalSymlinks(p)
+			if err != nil {
+				logf("phplslow: skip %s: %v", p, err)
+				continue
+			}
+			if slices.Contains(chain, canonical) {
+				logf("phplslow: skip %s: a symlink cycle", p)
+				continue
+			}
+			sub, err := os.ReadDir(p)
+			if err != nil {
+				logf("phplslow: skip %s: %v", p, err)
+				continue
+			}
+			walkDir(p, r, sub, append(chain[:len(chain):len(chain)], canonical), paths, logf)
+		case mode.IsRegular() && strings.HasSuffix(e.Name(), ".php"):
+			*paths = append(*paths, r)
+		}
+	}
+}
+
+// readFile reads a regular file. The file is opened without blocking and checked after opening, so a name that
+// has become a named pipe, a socket or a device by then is not read.
+func readFile(name string) ([]byte, error) {
+	f, err := os.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s: not a regular file", name)
+	}
+	return io.ReadAll(f)
 }
 
 func (ix *Index) complete() (bool, error) {
@@ -173,7 +221,7 @@ func (ix *Index) sameFiles(root string, paths []string, logf func(string, ...any
 	}
 	read := 0
 	for _, p := range paths {
-		src, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(p)))
+		src, err := readFile(filepath.Join(root, filepath.FromSlash(p)))
 		if err != nil {
 			logf("phplslow: skip %s: %v", p, err)
 			continue
@@ -198,7 +246,8 @@ func (ix *Index) build(root string, paths []string, logf func(string, ...any)) (
 	if err := ix.conn.Exec(`
 		DELETE FROM meta; DELETE FROM files; DELETE FROM symbols; DELETE FROM links;
 		CREATE TEMP TABLE calls (key TEXT NOT NULL, file INTEGER NOT NULL,
-			sl INTEGER NOT NULL, sc INTEGER NOT NULL, el INTEGER NOT NULL, ec INTEGER NOT NULL);`); err != nil {
+			sl INTEGER NOT NULL, sc INTEGER NOT NULL, el INTEGER NOT NULL, ec INTEGER NOT NULL, global TEXT NOT NULL);
+		CREATE TEMP TABLE reached (name TEXT);`); err != nil {
 		return err
 	}
 	insFile, _, err := ix.conn.Prepare(`INSERT INTO files (path, hash) VALUES (?, ?)`)
@@ -211,14 +260,21 @@ func (ix *Index) build(root string, paths []string, logf func(string, ...any)) (
 		return err
 	}
 	defer insSymbol.Close()
-	insCall, _, err := ix.conn.Prepare(`INSERT INTO temp.calls (key, file, sl, sc, el, ec) VALUES (?, ?, ?, ?, ?, ?)`)
+	insCall, _, err := ix.conn.Prepare(
+		`INSERT INTO temp.calls (key, file, sl, sc, el, ec, global) VALUES (?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return err
 	}
 	defer insCall.Close()
+	// A row of reached is a top-level variable some file reaches by name; a NULL name stands for any.
+	insReached, _, err := ix.conn.Prepare(`INSERT INTO temp.reached (name) VALUES (?)`)
+	if err != nil {
+		return err
+	}
+	defer insReached.Close()
 
 	for _, p := range paths {
-		src, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(p)))
+		src, err := readFile(filepath.Join(root, filepath.FromSlash(p)))
 		if err != nil {
 			logf("phplslow: skip %s: %v", p, err)
 			continue
@@ -238,21 +294,35 @@ func (ix *Index) build(root string, paths []string, logf func(string, ...any)) (
 			}
 		}
 		for _, c := range facts.Calls {
-			if err := exec(insCall, c.Key, file, c.Name); err != nil {
+			if err := exec(insCall, c.Key, file, c.Name, c.Global); err != nil {
+				return fmt.Errorf("%s: %w", p, err)
+			}
+		}
+		for _, name := range facts.Globals {
+			if err := exec(insReached, name); err != nil {
+				return fmt.Errorf("%s: %w", p, err)
+			}
+		}
+		if facts.AnyGlobal {
+			if err := exec(insReached, nil); err != nil {
 				return fmt.Errorf("%s: %w", p, err)
 			}
 		}
 	}
-	// A call becomes a link only when its target Symbol is declared somewhere in the Workspace.
+	// A call becomes a link only when its target Symbol is declared somewhere in the Workspace, and, on a top-level
+	// variable, only when no file of the Workspace reaches that variable through `global` or `$GLOBALS`.
 	return ix.conn.Exec(`
 		INSERT INTO links (key, file, sl, sc, el, ec)
 			SELECT key, file, sl, sc, el, ec FROM temp.calls c
-			WHERE EXISTS (SELECT 1 FROM symbols s WHERE s.key = c.key);
+			WHERE EXISTS (SELECT 1 FROM symbols s WHERE s.key = c.key)
+			AND (c.global = '' OR NOT EXISTS (
+				SELECT 1 FROM temp.reached r WHERE r.name IS NULL OR r.name = c.global));
 		DROP TABLE temp.calls;
+		DROP TABLE temp.reached;
 		INSERT INTO meta (key, value) VALUES ('complete', '1');`)
 }
 
-// exec binds args in order and runs stmt once. A php.Range binds as four integers.
+// exec binds args in order and runs stmt once. A php.Range binds as four integers, nil as NULL.
 func exec(stmt *sqlite3.Stmt, args ...any) error {
 	i := 1
 	for _, a := range args {
@@ -264,8 +334,8 @@ func exec(stmt *sqlite3.Stmt, args ...any) error {
 			err = stmt.BindBlob(i, v)
 		case int64:
 			err = stmt.BindInt64(i, v)
-		case int:
-			err = stmt.BindInt(i, v)
+		case nil:
+			err = stmt.BindNull(i)
 		case php.Range:
 			err = errors.Join(stmt.BindInt(i, v.Start.Line), stmt.BindInt(i+1, v.Start.Character),
 				stmt.BindInt(i+2, v.End.Line), stmt.BindInt(i+3, v.End.Character))

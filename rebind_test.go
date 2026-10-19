@@ -1,0 +1,67 @@
+package main_test
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+var (
+	rebindCartAdd   = place{"src/Shop/Cart.php", "add(string $sku): void"}
+	rebindResolving = []place{
+		{"src/functions.php", "add('plain')"},
+		{"src/functions.php", "add('mutated')"},
+		{"src/top.php", "add('top-level')"},
+	}
+)
+
+// A variable holds `new X` only when nothing in the program can bind it to another value: a call on it that
+// something else may rebind has no definition.
+func TestRebindableVariableIsUnknown(t *testing.T) {
+	root := workspace(t, "rebind")
+	c := start(t, cache(t))
+	c.initialize(root)
+
+	tests := []struct {
+		name string
+		at   place
+		want []place
+	}{
+		{"global in another function", place{"src/top.php", "add('global')"}, nil},
+		{"$GLOBALS in another function", place{"src/top.php", "add('globals')"}, nil},
+		{"by-reference parameter", place{"src/functions.php", "add('by-reference')"}, nil},
+		{"by-reference parameter of a builtin", place{"src/functions.php", "add('builtin')"}, nil},
+		{"argument of a function", place{"src/functions.php", "add('function-argument')"}, nil},
+		{"argument of a method", place{"src/functions.php", "add('method-argument')"}, nil},
+		{"argument of new", place{"src/functions.php", "add('new-argument')"}, nil},
+		{"variable variable", place{"src/functions.php", "add('variable-variable')"}, nil},
+		{"extract", place{"src/functions.php", "add('extract')"}, nil},
+		{"include", place{"src/functions.php", "add('include')"}, nil},
+		{"eval", place{"src/functions.php", "add('eval')"}, nil},
+		{"parse_str with one argument", place{"src/functions.php", "add('parse-str')"}, nil},
+		{"function body", place{"src/functions.php", "add('plain')"}, []place{rebindCartAdd}},
+		{"object passed to its method", place{"src/functions.php", "add('mutated')"}, []place{rebindCartAdd}},
+		{"top level nothing reaches", place{"src/top.php", "add('top-level')"}, []place{rebindCartAdd}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.ElementsMatch(t, locations(t, root, tt.want), definition(c, root, tt.at))
+		})
+	}
+	t.Run("references", func(t *testing.T) {
+		assert.ElementsMatch(t, locations(t, root, rebindResolving), references(c, root, rebindCartAdd, false))
+	})
+	c.stop()
+}
+
+// `$GLOBALS[$name]` may write any top-level variable of the Workspace.
+func TestDynamicGlobalsMakeTopLevelVariablesUnknown(t *testing.T) {
+	root := workspace(t, "dynamic-globals")
+	c := start(t, cache(t))
+	c.initialize(root)
+
+	declaration := place{"src/Cart.php", "add(string $sku): void"}
+	want := []place{{"src/app.php", "add('in-function')"}}
+	assert.ElementsMatch(t, locations(t, root, want), references(c, root, declaration, false))
+	c.stop()
+}

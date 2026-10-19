@@ -43,8 +43,8 @@ const (
 	codeInvalidRequest       = -32600
 	codeMethodNotFound       = -32601
 	codeInvalidParams        = -32602
-	codeInternalError        = -32603
 	codeServerNotInitialized = -32002
+	codeRequestCancelled     = -32800
 	codeRequestFailed        = -32803
 )
 
@@ -68,33 +68,52 @@ func read(r *bufio.Reader) (*message, error) {
 	return &m, nil
 }
 
-// writer sends whole messages; it is safe for concurrent use.
+// writer sends whole messages; it is safe for concurrent use. After the first failed write it sends nothing more
+// and failed is closed; err is the cause.
 type writer struct {
-	mu sync.Mutex
-	w  io.Writer
+	mu     sync.Mutex
+	w      io.Writer
+	err    error
+	failed chan struct{}
 }
 
-func (w *writer) reply(id json.RawMessage, value any) error {
-	return w.send(result{JSONRPC: "2.0", ID: id, Result: value})
+func newWriter(w io.Writer) *writer {
+	return &writer{w: w, failed: make(chan struct{})}
 }
 
-func (w *writer) fail(id json.RawMessage, code int, text string) error {
+func (w *writer) reply(id json.RawMessage, value any) {
+	w.send(result{JSONRPC: "2.0", ID: id, Result: value})
+}
+
+func (w *writer) fail(id json.RawMessage, code int, text string) {
 	if id == nil {
 		id = json.RawMessage("null")
 	}
-	return w.send(failure{JSONRPC: "2.0", ID: id, Error: responseError{Code: code, Message: text}})
+	w.send(failure{JSONRPC: "2.0", ID: id, Error: responseError{Code: code, Message: text}})
 }
 
-func (w *writer) send(m any) error {
+func (w *writer) send(m any) {
 	body, err := json.Marshal(m)
-	if err != nil {
-		return err
-	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if _, err := fmt.Fprintf(w.w, "Content-Length: %d\r\n\r\n", len(body)); err != nil {
-		return err
+	if w.err != nil {
+		return
 	}
-	_, err = w.w.Write(body)
-	return err
+	if err == nil {
+		_, err = fmt.Fprintf(w.w, "Content-Length: %d\r\n\r\n", len(body))
+	}
+	if err == nil {
+		_, err = w.w.Write(body)
+	}
+	if err != nil {
+		w.err = err
+		close(w.failed)
+	}
+}
+
+// cause is the error of the failed write.
+func (w *writer) cause() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.err
 }

@@ -3,6 +3,8 @@ package main_test
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,12 +13,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf16"
 
+	"github.com/ncruces/go-sqlite3"
 	"github.com/stretchr/testify/require"
 )
 
@@ -47,9 +52,45 @@ const patience = 30 * time.Second
 // workspace copies testdata/<name> into a fresh directory and returns its root.
 func workspace(t *testing.T, name string) string {
 	t.Helper()
-	root := filepath.Join(t.TempDir(), "ws")
+	return workspaceAt(t, name, "ws")
+}
+
+// workspaceAt copies testdata/<name> into a fresh directory named dir and returns its root.
+func workspaceAt(t *testing.T, name, dir string) string {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), dir)
 	require.NoError(t, os.CopyFS(root, os.DirFS(filepath.Join("testdata", name))))
 	return root
+}
+
+// indexFile is the index file of root that ADR 0001 names for a process whose user cache directory is home.
+func indexFile(home, root string) string {
+	dir := home
+	if runtime.GOOS == "darwin" {
+		dir = filepath.Join(home, "Library", "Caches")
+	}
+	sum := sha256.Sum256([]byte(root))
+	return filepath.Join(dir, "phplslow", "index-v1", hex.EncodeToString(sum[:16]), "index.sqlite")
+}
+
+// lockIndex holds an exclusive lock on the index file of root for processes with home as their cache directory:
+// such a process can neither read nor build that index until the returned func releases the lock.
+func lockIndex(t *testing.T, home, root string) func() {
+	t.Helper()
+	path := indexFile(home, root)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	conn, err := sqlite3.Open(path)
+	require.NoError(t, err)
+	require.NoError(t, conn.Exec(`BEGIN EXCLUSIVE`))
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			require.NoError(t, conn.Exec(`ROLLBACK`))
+			require.NoError(t, conn.Close())
+		})
+	}
+	t.Cleanup(release)
+	return release
 }
 
 // cache is a directory that stands for the user's cache directory of one or more phplslow processes.
@@ -137,6 +178,47 @@ func start(t *testing.T, home string) *client {
 	return c
 }
 
+// startWithoutReader runs phplslow like start, but with a stdout whose reading end is already closed: every write
+// of the process to stdout fails.
+func startWithoutReader(t *testing.T, home string) *client {
+	t.Helper()
+	cmd := exec.Command(binary)
+	cmd.Env = append(os.Environ(), "HOME="+home, "XDG_CACHE_HOME="+home, "LOCALAPPDATA="+home)
+	stdin, err := cmd.StdinPipe()
+	require.NoError(t, err)
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	require.NoError(t, r.Close())
+	cmd.Stdout = w
+	c := &client{t: t, cmd: cmd, stdin: stdin, responses: make(chan response), stderr: &syncBuffer{},
+		exited: make(chan struct{})}
+	cmd.Stderr = c.stderr
+	require.NoError(t, cmd.Start())
+	require.NoError(t, w.Close())
+	t.Cleanup(func() {
+		cmd.Process.Kill()
+		<-c.exited
+	})
+	go func() {
+		c.exitErr = cmd.Wait()
+		close(c.responses)
+		close(c.exited)
+	}()
+	return c
+}
+
+// exitCode waits for the process to exit and returns its exit code; -1 when a signal ended it.
+func (c *client) exitCode() int {
+	c.t.Helper()
+	select {
+	case <-c.exited:
+		return c.cmd.ProcessState.ExitCode()
+	case <-time.After(patience):
+		require.FailNow(c.t, "phplslow did not exit", "stderr:\n%s", c.stderr)
+		return 0
+	}
+}
+
 func (c *client) write(m map[string]any) {
 	c.t.Helper()
 	m["jsonrpc"] = "2.0"
@@ -157,6 +239,12 @@ func (c *client) send(method string, params any) int {
 func (c *client) notify(method string, params any) {
 	c.t.Helper()
 	c.write(map[string]any{"method": method, "params": params})
+}
+
+// cancel asks the server to cancel request id.
+func (c *client) cancel(id int) {
+	c.t.Helper()
+	c.notify("$/cancelRequest", map[string]any{"id": id})
 }
 
 // await is the response to request id. The server answers requests one at a time in these tests, so the next
@@ -248,7 +336,7 @@ func (p place) location(t *testing.T, root string) location {
 	word := len(p.needle) - len(strings.TrimLeft(p.needle,
 		"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"))
 	line := strings.Count(text[:at], "\n")
-	column := at - (strings.LastIndex(text[:at], "\n") + 1)
+	column := len(utf16.Encode([]rune(text[strings.LastIndex(text[:at], "\n")+1 : at])))
 	return location{URI: uri(path), Range: span{
 		Start: position{Line: line, Character: column},
 		End:   position{Line: line, Character: column + word},
@@ -284,7 +372,12 @@ func definition(c *client, root string, at place) []location {
 
 func references(c *client, root string, at place, declaration bool) []location {
 	c.t.Helper()
-	params := at.params(c.t, root)
+	return decode(c.t, c.call("textDocument/references", referencesParams(c.t, root, at, declaration)))
+}
+
+func referencesParams(t *testing.T, root string, at place, declaration bool) map[string]any {
+	t.Helper()
+	params := at.params(t, root)
 	params["context"] = map[string]any{"includeDeclaration": declaration}
-	return decode(c.t, c.call("textDocument/references", params))
+	return params
 }

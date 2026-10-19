@@ -10,15 +10,19 @@ var (
 	cartAdd = place{"src/Shop/Cart.php", "add(string $sku): void"}
 	wishAdd = place{"src/Shop/Wishlist.php", "add(string $sku): void"}
 
-	cartAddCalls = []place{
+	checkoutCartAddCalls = []place{
 		{"src/Shop/Checkout.php", "add('apple')"},
 		{"src/Shop/Checkout.php", "ADD('pear')"},
+	}
+	appCartAddCalls = []place{
 		{"src/app.php", "add('kiwi')"},
 		{"src/app.php", "add('lime')"},
 		{"src/app.php", "add('date')"},
+		{"src/app.php", "add('emoji')"},
 		{"src/app.php", "add('pea')"},
 		{"src/app.php", "add('oat')"},
 	}
+	cartAddCalls = append(append([]place{}, checkoutCartAddCalls...), appCartAddCalls...)
 )
 
 func TestMethodDefinition(t *testing.T) {
@@ -35,6 +39,7 @@ func TestMethodDefinition(t *testing.T) {
 		{"method name in another case", place{"src/Shop/Checkout.php", "ADD('pear')"}, []place{cartAdd}},
 		{"call on new in parentheses", place{"src/app.php", "add('lime')"}, []place{cartAdd}},
 		{"nullsafe call", place{"src/app.php", "add('date')"}, []place{cartAdd}},
+		{"call after Cyrillic and an emoji on the line", place{"src/app.php", "add('emoji')"}, []place{cartAdd}},
 		{"variable of the arrow function's parent", place{"src/app.php", "add('pea')"}, []place{cartAdd}},
 		{"variable imported by a closure", place{"src/app.php", "add('oat')"}, []place{cartAdd}},
 		{"same method name of another class", place{"src/Shop/Checkout.php", "add('plum')"}, []place{wishAdd}},
@@ -75,5 +80,16 @@ func TestMethodReferences(t *testing.T) {
 			assert.ElementsMatch(t, locations(t, root, tt.want), references(c, root, tt.at, tt.declaration))
 		})
 	}
+	c.stop()
+}
+
+func TestRootWithASpaceAndAPercentSign(t *testing.T) {
+	root := workspaceAt(t, "methods", "my ws 100%")
+	c := start(t, cache(t))
+	c.initialize(root)
+
+	call := place{"src/app.php", "add('kiwi')"}
+	assert.ElementsMatch(t, locations(t, root, []place{cartAdd}), definition(c, root, call))
+	assert.ElementsMatch(t, locations(t, root, cartAddCalls), references(c, root, call, false))
 	c.stop()
 }

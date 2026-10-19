@@ -6,6 +6,7 @@ $basket = new Cart();
 $basket->add('kiwi');
 (new \Shop\Cart())->add('lime');
 $basket?->add('date');
+/* Корзина 🛒 */ $basket->add('emoji');
 
 $mixed = new Cart();
 $mixed = new \Shop\Wishlist();

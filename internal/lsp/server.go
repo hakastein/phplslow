@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,35 +17,52 @@ import (
 )
 
 // Serve speaks LSP on in and out until the client sends `exit` or closes in, and returns the process exit code:
-// 0 after `shutdown`, 1 otherwise. Diagnostic lines go to log; they are not a protocol.
+// 0 after `shutdown`, 1 otherwise. A failed write to out ends the session with 1. Diagnostic lines go to log; they
+// are not a protocol.
 func Serve(in io.Reader, out io.Writer, log io.Writer) int {
-	s := &server{out: &writer{w: out}, ready: make(chan struct{})}
+	s := &server{out: newWriter(out), ready: make(chan struct{}), waiting: map[string]chan struct{}{}}
 	var logMu sync.Mutex
 	s.logf = func(format string, args ...any) {
 		logMu.Lock()
 		defer logMu.Unlock()
 		fmt.Fprintf(log, format+"\n", args...)
 	}
-	r := bufio.NewReader(in)
+	messages, readErr := make(chan *message), make(chan error, 1)
+	go func() {
+		r := bufio.NewReader(in)
+		for {
+			m, err := read(r)
+			if err != nil {
+				readErr <- err
+				return
+			}
+			messages <- m
+		}
+	}()
+	defer s.close()
 	for {
-		m, err := read(r)
-		if err != nil {
+		select {
+		case <-s.out.failed:
+			s.logf("phplslow: write: %v", s.out.cause())
+			return 1
+		case err := <-readErr:
 			if !errors.Is(err, io.EOF) {
 				s.logf("phplslow: read: %v", err)
 			}
 			return s.exitCode()
-		}
-		if m.bad != nil {
-			s.out.fail(nil, codeParseError, m.bad.Error())
-			continue
-		}
-		if m.ID == nil {
-			if m.Method == "exit" {
+		case m := <-messages:
+			switch {
+			case m.bad != nil:
+				s.out.fail(nil, codeParseError, m.bad.Error())
+			case m.ID != nil:
+				s.request(m)
+			case m.Method == "exit":
 				return s.exitCode()
+			case m.Method == "$/cancelRequest":
+				s.cancel(m.Params)
 			}
-			continue // other notifications change nothing: answers come from the files on disk
+			// other notifications change nothing: answers come from the files on disk
 		}
-		s.request(m)
 	}
 }
 
@@ -56,10 +74,25 @@ type server struct {
 	initialized bool
 	shutdown    bool
 	root        string
+	waiting     map[string]chan struct{} // requests waiting for the index by id; closing the channel cancels one
 
 	ready chan struct{} // closed when ix or ixErr is set
 	ix    *index.Index
 	ixErr error
+}
+
+// close closes the index if it is open. An index still being built is left to the end of the process: its
+// unfinished transaction leaves the previous state.
+func (s *server) close() {
+	select {
+	case <-s.ready:
+		if s.ix != nil {
+			if err := s.ix.Close(); err != nil {
+				s.logf("phplslow: close index: %v", err)
+			}
+		}
+	default:
+	}
 }
 
 func (s *server) exitCode() int {
@@ -93,9 +126,9 @@ func (s *server) request(m *message) {
 		s.mu.Unlock()
 		s.out.reply(m.ID, nil)
 	case m.Method == "textDocument/definition":
-		go s.definition(m)
+		go s.definition(m, s.wait(m.ID))
 	case m.Method == "textDocument/references":
-		go s.references(m)
+		go s.references(m, s.wait(m.ID))
 	default:
 		s.out.fail(m.ID, codeMethodNotFound, m.Method+": not supported")
 	}
@@ -181,28 +214,68 @@ type lspPosition struct {
 	Character int `json:"character"`
 }
 
-func (s *server) definition(m *message) {
-	s.answer(m, func(ix *index.Index, file string, p positionParams) ([]index.Location, error) {
+// wait registers request id as waiting for the index; closing the returned channel cancels it.
+func (s *server) wait(id json.RawMessage) chan struct{} {
+	cancel := make(chan struct{})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.waiting[idKey(id)] = cancel
+	return cancel
+}
+
+// cancel handles `$/cancelRequest`: a request that waits for the index is answered RequestCancelled; an unknown or
+// answered id changes nothing.
+func (s *server) cancel(params json.RawMessage) {
+	var p struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if json.Unmarshal(params, &p) != nil || p.ID == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := idKey(p.ID)
+	if cancel, ok := s.waiting[key]; ok {
+		delete(s.waiting, key)
+		close(cancel)
+	}
+}
+
+// idKey is the request id as a map key: its compact JSON.
+func idKey(id json.RawMessage) string {
+	var b bytes.Buffer
+	if json.Compact(&b, id) != nil {
+		return string(id)
+	}
+	return b.String()
+}
+
+func (s *server) definition(m *message, cancel chan struct{}) {
+	s.answer(m, cancel, func(ix *index.Index, file string, p positionParams) ([]index.Location, error) {
 		return ix.Definition(file, php.Position{Line: p.Position.Line, Character: p.Position.Character})
 	})
 }
 
-func (s *server) references(m *message) {
-	s.answer(m, func(ix *index.Index, file string, p positionParams) ([]index.Location, error) {
+func (s *server) references(m *message, cancel chan struct{}) {
+	s.answer(m, cancel, func(ix *index.Index, file string, p positionParams) ([]index.Location, error) {
 		pos := php.Position{Line: p.Position.Line, Character: p.Position.Character}
 		return ix.References(file, pos, p.Context.IncludeDeclaration)
 	})
 }
 
 // answer waits until the index is ready and answers a position request from it: an answer is never given from
-// an index that is not there.
-func (s *server) answer(m *message, query func(*index.Index, string, positionParams) ([]index.Location, error)) {
+// an index that is not there. A request cancelled while it waits is answered RequestCancelled.
+func (s *server) answer(m *message, cancel chan struct{},
+	query func(*index.Index, string, positionParams) ([]index.Location, error)) {
+	if !s.awaitIndex(m.ID, cancel) {
+		s.out.fail(m.ID, codeRequestCancelled, m.Method+": cancelled")
+		return
+	}
 	var p positionParams
 	if err := json.Unmarshal(m.Params, &p); err != nil {
 		s.out.fail(m.ID, codeInvalidParams, m.Method+": "+err.Error())
 		return
 	}
-	<-s.ready
 	if s.ixErr != nil {
 		s.out.fail(m.ID, codeRequestFailed, m.Method+": index: "+s.ixErr.Error())
 		return
@@ -227,6 +300,24 @@ func (s *server) answer(m *message, query func(*index.Index, string, positionPar
 		}
 	}
 	s.out.reply(m.ID, out)
+}
+
+// ready_ waits until the index is ready or the request is cancelled, and reports whether the index is ready. The
+// request stops waiting either way: a later cancel finds nothing.
+func (s *server) awaitIndex(id json.RawMessage, cancel chan struct{}) bool {
+	defer func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if key := idKey(id); s.waiting[key] == cancel {
+			delete(s.waiting, key)
+		}
+	}()
+	select {
+	case <-s.ready:
+		return true
+	case <-cancel:
+		return false
+	}
 }
 
 // uriPath is the file path of a file URI; "" for any other URI.
