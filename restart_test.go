@@ -73,7 +73,8 @@ func appendToApp(t *testing.T, root string) {
 	app := filepath.Join(root, "src", "app.php")
 	src, err := os.ReadFile(app)
 	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(app, append(src, "$basket->add('fresh');\n"...), 0o600))
+	fresh := "\nfunction fresh(): void\n{\n    $basket = new Cart();\n    $basket->add('fresh');\n}\n"
+	require.NoError(t, os.WriteFile(app, append(src, fresh...), 0o600))
 }
 
 func addShop(t *testing.T, root string) {

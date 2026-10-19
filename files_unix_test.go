@@ -12,7 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const linkedCall = "<?php\n\n$linked = new \\Shop\\Cart();\n$linked->add('linked');\n"
+const linkedCall = "<?php\n\nfunction linked(): void\n{\n" +
+	"    $linked = new \\Shop\\Cart();\n    $linked->add('linked');\n}\n"
 
 // A named pipe and a symlink to one have .php names; reading either would wait for a writer forever.
 func TestNonRegularFilesAreNotIndexed(t *testing.T) {

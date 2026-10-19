@@ -11,7 +11,6 @@ var (
 	rebindResolving = []place{
 		{"src/functions.php", "add('plain')"},
 		{"src/functions.php", "add('mutated')"},
-		{"src/top.php", "add('top-level')"},
 	}
 )
 
@@ -39,9 +38,18 @@ func TestRebindableVariableIsUnknown(t *testing.T) {
 		{"include", place{"src/functions.php", "add('include')"}, nil},
 		{"eval", place{"src/functions.php", "add('eval')"}, nil},
 		{"parse_str with one argument", place{"src/functions.php", "add('parse-str')"}, nil},
+		{"reference assignment", place{"src/functions.php", "add('reference-assign')"}, nil},
+		{"foreach by reference", place{"src/functions.php", "add('foreach-by-reference')"}, nil},
+		{"short list", place{"src/functions.php", "add('short-list')"}, nil},
+		{"keyed list", place{"src/functions.php", "add('keyed-list')"}, nil},
+		{"catch", place{"src/functions.php", "add('catch')"}, nil},
+		{"use by reference", place{"src/functions.php", "add('use-by-reference')"}, nil},
+		{"unset", place{"src/functions.php", "add('unset')"}, nil},
+		{"braced variable variable", place{"src/functions.php", "add('braced-variable')"}, nil},
+		{"mb_parse_str with one argument", place{"src/functions.php", "add('mb-parse-str')"}, nil},
+		{"global variable variable", place{"src/functions.php", "add('global-variable-variable')"}, nil},
 		{"function body", place{"src/functions.php", "add('plain')"}, []place{rebindCartAdd}},
 		{"object passed to its method", place{"src/functions.php", "add('mutated')"}, []place{rebindCartAdd}},
-		{"top level nothing reaches", place{"src/top.php", "add('top-level')"}, []place{rebindCartAdd}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -51,17 +59,5 @@ func TestRebindableVariableIsUnknown(t *testing.T) {
 	t.Run("references", func(t *testing.T) {
 		assert.ElementsMatch(t, locations(t, root, rebindResolving), references(c, root, rebindCartAdd, false))
 	})
-	c.stop()
-}
-
-// `$GLOBALS[$name]` may write any top-level variable of the Workspace.
-func TestDynamicGlobalsMakeTopLevelVariablesUnknown(t *testing.T) {
-	root := workspace(t, "dynamic-globals")
-	c := start(t, cache(t))
-	c.initialize(root)
-
-	declaration := place{"src/Cart.php", "add(string $sku): void"}
-	want := []place{{"src/app.php", "add('in-function')"}}
-	assert.ElementsMatch(t, locations(t, root, want), references(c, root, declaration, false))
 	c.stop()
 }

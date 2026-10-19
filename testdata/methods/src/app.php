@@ -2,23 +2,26 @@
 
 use Shop\Cart;
 
-$basket = new Cart();
-$basket->add('kiwi');
-(new \Shop\Cart())->add('lime');
-$basket?->add('date');
-/* Корзина 🛒 */ $basket->add('emoji');
+function basket(): void
+{
+    $basket = new Cart();
+    $basket->add('kiwi');
+    (new \Shop\Cart())->add('lime');
+    $basket?->add('date');
+    /* Корзина 🛒 */ $basket->add('emoji');
 
-$mixed = new Cart();
-$mixed = new \Shop\Wishlist();
-$mixed->add('nut');
+    $mixed = new Cart();
+    $mixed = new \Shop\Wishlist();
+    $mixed->add('nut');
 
-$early->add('yam');
-$early = new Cart();
+    $early->add('yam');
+    $early = new Cart();
 
-$arrow = fn () => $basket->add('pea');
-$closure = function () use ($basket) {
-    $basket->add('oat');
-};
+    $arrow = fn () => $basket->add('pea');
+    $closure = function () use ($basket) {
+        $basket->add('oat');
+    };
 
-$missing = new Cart();
-$missing->remove('rye');
+    $missing = new Cart();
+    $missing->remove('rye');
+}

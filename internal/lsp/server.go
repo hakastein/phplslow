@@ -302,7 +302,7 @@ func (s *server) answer(m *message, cancel chan struct{},
 	s.out.reply(m.ID, out)
 }
 
-// ready_ waits until the index is ready or the request is cancelled, and reports whether the index is ready. The
+// awaitIndex waits until the index is ready or the request is cancelled, and reports whether the index is ready. The
 // request stops waiting either way: a later cancel finds nothing.
 func (s *server) awaitIndex(id json.RawMessage, cancel chan struct{}) bool {
 	defer func() {

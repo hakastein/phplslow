@@ -70,7 +70,7 @@ func indexFile(home, root string) string {
 		dir = filepath.Join(home, "Library", "Caches")
 	}
 	sum := sha256.Sum256([]byte(root))
-	return filepath.Join(dir, "phplslow", "index-v1", hex.EncodeToString(sum[:16]), "index.sqlite")
+	return filepath.Join(dir, "phplslow", "index-v2", hex.EncodeToString(sum[:16]), "index.sqlite")
 }
 
 // lockIndex holds an exclusive lock on the index file of root for processes with home as their cache directory:

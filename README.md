@@ -10,13 +10,23 @@ indexes the PHP files of the workspace into SQLite on disk and answers from that
 
 - `textDocument/definition` and `textDocument/references` for a method call whose receiver class is known from the
   code around it:
-  - `(new Cart())->add()` and `(new Cart())?->add()`;
-  - `$cart->add()` where every assignment to `$cart` in the same function, method, closure or file top level is
+  - `(new Cart())->add()` and `(new Cart())?->add()`, anywhere, also at the top level of a file;
+  - `$cart->add()` inside a function, method or closure body where every assignment to `$cart` in that body is
     `new Cart(...)` of one class, the first of them comes before the call and nothing can bind `$cart` to another
-    value. An arrow function sees the variables of its parent; a closure sees those it imports with `use` by value.
-  - Passing `$cart` as an argument (the parameter may be by reference), `$$name`, `extract`, `eval`, `include`/
-    `require` and one-argument `parse_str` make it unknown. A top-level variable is unknown when any file of the
-    workspace uses `global $cart` or `$GLOBALS['cart']`, or `$GLOBALS` with a key that is not a string literal.
+    value. An arrow function sees the variables of its parent; a closure sees those it imports with `use` by value;
+    either only when the parent is a function, method or closure body.
+  - A variable at the top level of a file is never known, also inside an arrow function or a closure that takes it
+    from there. A superglobal (`$GLOBALS`, `$_SERVER`, `$_GET`, `$_POST`, `$_FILES`, `$_COOKIE`, `$_SESSION`,
+    `$_REQUEST`, `$_ENV`, case-sensitive) is never known in any scope.
+  - Any other write makes the variable unknown: another assignment, a compound assignment, `++`/`--`, a parameter,
+    `foreach` (also by reference), `list(...)` and `[...]` destructuring (also with keys), `catch`, `global`,
+    `static`, `unset`, a reference (`$y = &$x`, `use (&$x)`), and passing it as an argument (the parameter may be
+    by reference). A method call on the variable itself does not.
+  - Every variable of the body is unknown when the body has `$$name` or `${...}` (also in `global $$name`),
+    `extract`, `eval`, `include`, `include_once`, `require`, `require_once`, or `parse_str` or `mb_parse_str` with
+    one argument.
+  - `new self`, `new static`, `new parent`, an anonymous class and a dynamic class name give no receiver class.
+  - These rules are recorded in [ADR 0001](docs/adr/0001-workspace-index-on-disk.md) (in Russian).
 - The answer lists the method declared in that class. A call becomes a reference only when that class declares the
   method; a call that is not resolved this way is not a reference, whatever its method name.
 - `references` from a call site or from the method declaration lists every resolved call site of the method;

@@ -1,5 +1,6 @@
 // Package php reads one PHP file into the facts the index stores: method declarations and method calls whose
-// receiver class is known from the file itself.
+// receiver class is known: `(new X)->m()` anywhere, and `$x->m()` inside a function, method or closure body whose
+// own writes to `$x` are all `new X` of one class.
 package php
 
 import (
@@ -22,26 +23,17 @@ type Method struct {
 	Name Range  // the method name in the declaration
 }
 
-// Call is a method call whose receiver class is known: `(new X)->m()` or `$x->m()` where nothing in the file can
-// bind `$x` to anything but `new X`. It becomes a Reference only when X declares m.
+// Call is a method call whose receiver class is known: `(new X)->m()`, or `$x->m()` in a function, method or
+// closure body where nothing can bind `$x` to anything but `new X`. It becomes a Reference only when X declares m.
 type Call struct {
 	Key  string // MethodKey of the receiver class and the called name
 	Name Range  // the method name at the call site
-	// Global is the name of the top-level variable the receiver class comes from; "" when the receiver is not a
-	// top-level variable. Any file can reach a top-level variable through `global` or `$GLOBALS`, so such a call
-	// is known only when no file of the Workspace does.
-	Global string
 }
 
 // Facts is what one file contributes to the index.
 type Facts struct {
 	Methods []Method
 	Calls   []Call
-	// Globals is the top-level variables the file reaches by name: `global $n` and `$GLOBALS['n']`.
-	Globals []string
-	// AnyGlobal is set when the file may reach a top-level variable whose name it does not spell: `global $$n` or
-	// `$GLOBALS` used other than with a literal key.
-	AnyGlobal bool
 }
 
 // MethodKey names a method: the fully qualified class name without the leading backslash and the method name, in
@@ -68,7 +60,7 @@ func Parse(src []byte) (Facts, []string) {
 	names := nsresolver.NewNamespaceResolver()
 	traverser.NewTraverser(names).Traverse(root)
 
-	c := &collector{lines: newLines(src), names: names.ResolvedNames, globals: map[string]bool{}}
+	c := &collector{lines: newLines(src), names: names.ResolvedNames}
 	traverser.NewTraverser(c).Traverse(root)
 	return c.facts(), syntax
 }
@@ -87,12 +79,7 @@ type collector struct {
 	scopes     []*scope
 	events     []event
 	direct     []Call // calls on `new X`: known without a scope
-
-	globals         map[string]bool
-	globalsUses     int // `$GLOBALS` variables
-	globalsLiterals int // of them, those indexed with a literal key
-	anyGlobal       bool
-	noPosition      bool // a scope or an event has no position: no variable is known
+	noPosition bool   // a scope or an event has no position: no variable is known
 }
 
 type namespaceDecl struct {
@@ -130,11 +117,7 @@ const (
 )
 
 func (c *collector) facts() Facts {
-	f := Facts{Calls: c.direct, AnyGlobal: c.anyGlobal || c.globalsUses > c.globalsLiterals}
-	for name := range c.globals {
-		f.Globals = append(f.Globals, name)
-	}
-	slices.Sort(f.Globals)
+	f := Facts{Calls: c.direct}
 	for _, m := range c.methods {
 		if class := c.classAt(m.at); class != "" {
 			f.Methods = append(f.Methods, Method{
@@ -187,15 +170,9 @@ func (c *collector) variableCalls() []Call {
 	slices.SortFunc(calls, func(a, b event) int { return a.at - b.at })
 	var out []Call
 	for _, e := range calls {
-		class, from := innermost(scopes, e.at).classOf(e.name, e.at)
-		if class == "" {
-			continue
+		if class := innermost(scopes, e.at).classOf(e.name, e.at); class != "" {
+			out = append(out, Call{Key: MethodKey(class, e.class), Name: e.call})
 		}
-		global := ""
-		if from.top {
-			global = e.name
-		}
-		out = append(out, Call{Key: MethodKey(class, e.class), Name: e.call, Global: global})
 	}
 	return out
 }
@@ -365,11 +342,6 @@ func (c *collector) StmtForeach(n *ast.StmtForeach) {
 
 func (c *collector) StmtGlobal(n *ast.StmtGlobal) {
 	for _, v := range n.Vars {
-		if name := variable(v); name != "" {
-			c.globals[name] = true
-		} else {
-			c.anyGlobal = true
-		}
 		c.spoilTarget(v)
 	}
 }
@@ -382,27 +354,8 @@ func (c *collector) StmtUnset(n *ast.StmtUnset) {
 
 // A variable variable `$$n` may name any variable of its scope.
 func (c *collector) ExprVariable(n *ast.ExprVariable) {
-	id, ok := n.Name.(*ast.Identifier)
-	if !ok {
+	if _, ok := n.Name.(*ast.Identifier); !ok {
 		c.event(n, event{kind: dynamic})
-		return
-	}
-	if string(id.Value) == "$GLOBALS" {
-		c.globalsUses++
-	}
-}
-
-func (c *collector) ExprArrayDimFetch(n *ast.ExprArrayDimFetch) {
-	v, ok := n.Var.(*ast.ExprVariable)
-	if !ok {
-		return
-	}
-	if id, ok := v.Name.(*ast.Identifier); !ok || string(id.Value) != "$GLOBALS" {
-		return
-	}
-	if name, ok := literal(n.Dim); ok {
-		c.globals[name] = true
-		c.globalsLiterals++
 	}
 }
 
@@ -455,9 +408,16 @@ func (c *collector) call(receiver, method ast.Vertex) {
 		c.direct = append(c.direct, Call{Key: MethodKey(class, string(id.Value)), Name: name})
 		return
 	}
-	if v := variable(receiver); v != "" {
+	if v := variable(receiver); v != "" && !superglobals[v] {
 		c.event(id, event{kind: call, name: v, class: string(id.Value), call: name})
 	}
+}
+
+// superglobals are visible in every scope of the program without `global`: any function may write them, so their
+// class is never known. PHP spells variable names case-sensitively; `$_session` is an ordinary variable.
+var superglobals = map[string]bool{
+	"GLOBALS": true, "_SERVER": true, "_GET": true, "_POST": true, "_FILES": true, "_COOKIE": true,
+	"_SESSION": true, "_REQUEST": true, "_ENV": true,
 }
 
 // newClass is the class X of `new X(...)`, also in parentheses; "" for any other expression and for
@@ -524,23 +484,6 @@ func spreads(args []ast.Vertex) bool {
 	return false
 }
 
-// literal is the value of a quoted string literal without escapes or interpolation.
-func literal(e ast.Vertex) (string, bool) {
-	s, ok := e.(*ast.ScalarString)
-	if !ok || s.MinusTkn != nil || len(s.Value) < 2 {
-		return "", false
-	}
-	v := string(s.Value)
-	if q := v[0]; (q != '\'' && q != '"') || v[len(v)-1] != q {
-		return "", false
-	}
-	v = v[1 : len(v)-1]
-	if strings.ContainsAny(v, `\$`) {
-		return "", false
-	}
-	return v, true
-}
-
 func joinParts(parts []ast.Vertex) string {
 	names := make([]string, 0, len(parts))
 	for _, p := range parts {
@@ -572,7 +515,7 @@ func variable(e ast.Vertex) string {
 type scope struct {
 	start, end int // the byte range of the scope's node
 	parent     *scope
-	top        bool            // the file's top level
+	top        bool            // the file's top level: any file may reach its variables, so none is known
 	arrow      bool            // an arrow function sees every variable of its parent it does not write
 	uses       []closureUse    // a closure's `use` list
 	imports    map[string]bool // a closure sees the variables of its parent it imports by value with `use`
@@ -619,21 +562,22 @@ func (s *scope) spoil(name string) {
 	b.bad = true
 }
 
-// classOf is the class of variable name at byte offset at and the scope whose writes tell it; "" when the class is
-// not known.
-func (s *scope) classOf(name string, at int) (string, *scope) {
-	if s.dynamic {
-		return "", nil
+// classOf is the class of variable name at byte offset at; "" when the class is not known. A variable of the
+// top level is never known: `include`, `global` and `$GLOBALS` in any file, also one the Workspace does not index,
+// may write it.
+func (s *scope) classOf(name string, at int) string {
+	if s.top || s.dynamic {
+		return ""
 	}
 	b, ok := s.vars[name]
 	if !ok {
 		if s.parent != nil && (s.arrow || s.imports[name]) {
 			return s.parent.classOf(name, at)
 		}
-		return "", nil
+		return ""
 	}
 	if b.bad || at < b.after {
-		return "", nil
+		return ""
 	}
-	return b.class, s
+	return b.class
 }

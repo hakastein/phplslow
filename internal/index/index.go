@@ -22,9 +22,9 @@ import (
 	"github.com/hakastein/phplslow/internal/php"
 )
 
-// schemaDir names the layout of the index. An incompatible layout gets a new name, so an index of another layout is
-// never opened.
-const schemaDir = "index-v1"
+// schemaDir names the schema and the link semantics of the index. An incompatible change of either gets a new name,
+// so an index of another schema or with links resolved by other rules is never opened.
+const schemaDir = "index-v2"
 
 const schema = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
@@ -195,6 +195,17 @@ func readFile(name string) ([]byte, error) {
 	return io.ReadAll(f)
 }
 
+// snapshotFile reads the file p of the Workspace, relative to root, and hashes it for the snapshot. A file that
+// cannot be read is logged and is not part of the snapshot: ok is false.
+func snapshotFile(root, p string, logf func(string, ...any)) (src []byte, sum [sha256.Size]byte, ok bool) {
+	src, err := readFile(filepath.Join(root, filepath.FromSlash(p)))
+	if err != nil {
+		logf("phplslow: skip %s: %v", p, err)
+		return nil, sum, false
+	}
+	return src, sha256.Sum256(src), true
+}
+
 func (ix *Index) complete() (bool, error) {
 	stmt, _, err := ix.conn.Prepare(`SELECT 1 FROM meta WHERE key = 'complete'`)
 	if err != nil {
@@ -221,13 +232,11 @@ func (ix *Index) sameFiles(root string, paths []string, logf func(string, ...any
 	}
 	read := 0
 	for _, p := range paths {
-		src, err := readFile(filepath.Join(root, filepath.FromSlash(p)))
-		if err != nil {
-			logf("phplslow: skip %s: %v", p, err)
+		_, sum, ok := snapshotFile(root, p, logf)
+		if !ok {
 			continue
 		}
 		read++
-		sum := sha256.Sum256(src)
 		if stored[p] != hex.EncodeToString(sum[:]) {
 			return false, nil
 		}
@@ -246,8 +255,7 @@ func (ix *Index) build(root string, paths []string, logf func(string, ...any)) (
 	if err := ix.conn.Exec(`
 		DELETE FROM meta; DELETE FROM files; DELETE FROM symbols; DELETE FROM links;
 		CREATE TEMP TABLE calls (key TEXT NOT NULL, file INTEGER NOT NULL,
-			sl INTEGER NOT NULL, sc INTEGER NOT NULL, el INTEGER NOT NULL, ec INTEGER NOT NULL, global TEXT NOT NULL);
-		CREATE TEMP TABLE reached (name TEXT);`); err != nil {
+			sl INTEGER NOT NULL, sc INTEGER NOT NULL, el INTEGER NOT NULL, ec INTEGER NOT NULL);`); err != nil {
 		return err
 	}
 	insFile, _, err := ix.conn.Prepare(`INSERT INTO files (path, hash) VALUES (?, ?)`)
@@ -261,25 +269,17 @@ func (ix *Index) build(root string, paths []string, logf func(string, ...any)) (
 	}
 	defer insSymbol.Close()
 	insCall, _, err := ix.conn.Prepare(
-		`INSERT INTO temp.calls (key, file, sl, sc, el, ec, global) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+		`INSERT INTO temp.calls (key, file, sl, sc, el, ec) VALUES (?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return err
 	}
 	defer insCall.Close()
-	// A row of reached is a top-level variable some file reaches by name; a NULL name stands for any.
-	insReached, _, err := ix.conn.Prepare(`INSERT INTO temp.reached (name) VALUES (?)`)
-	if err != nil {
-		return err
-	}
-	defer insReached.Close()
 
 	for _, p := range paths {
-		src, err := readFile(filepath.Join(root, filepath.FromSlash(p)))
-		if err != nil {
-			logf("phplslow: skip %s: %v", p, err)
+		src, sum, ok := snapshotFile(root, p, logf)
+		if !ok {
 			continue
 		}
-		sum := sha256.Sum256(src)
 		if err := exec(insFile, p, sum[:]); err != nil {
 			return fmt.Errorf("%s: %w", p, err)
 		}
@@ -294,35 +294,21 @@ func (ix *Index) build(root string, paths []string, logf func(string, ...any)) (
 			}
 		}
 		for _, c := range facts.Calls {
-			if err := exec(insCall, c.Key, file, c.Name, c.Global); err != nil {
-				return fmt.Errorf("%s: %w", p, err)
-			}
-		}
-		for _, name := range facts.Globals {
-			if err := exec(insReached, name); err != nil {
-				return fmt.Errorf("%s: %w", p, err)
-			}
-		}
-		if facts.AnyGlobal {
-			if err := exec(insReached, nil); err != nil {
+			if err := exec(insCall, c.Key, file, c.Name); err != nil {
 				return fmt.Errorf("%s: %w", p, err)
 			}
 		}
 	}
-	// A call becomes a link only when its target Symbol is declared somewhere in the Workspace, and, on a top-level
-	// variable, only when no file of the Workspace reaches that variable through `global` or `$GLOBALS`.
+	// A call becomes a link only when its target Symbol is declared somewhere in the Workspace.
 	return ix.conn.Exec(`
 		INSERT INTO links (key, file, sl, sc, el, ec)
 			SELECT key, file, sl, sc, el, ec FROM temp.calls c
-			WHERE EXISTS (SELECT 1 FROM symbols s WHERE s.key = c.key)
-			AND (c.global = '' OR NOT EXISTS (
-				SELECT 1 FROM temp.reached r WHERE r.name IS NULL OR r.name = c.global));
+			WHERE EXISTS (SELECT 1 FROM symbols s WHERE s.key = c.key);
 		DROP TABLE temp.calls;
-		DROP TABLE temp.reached;
 		INSERT INTO meta (key, value) VALUES ('complete', '1');`)
 }
 
-// exec binds args in order and runs stmt once. A php.Range binds as four integers, nil as NULL.
+// exec binds args in order and runs stmt once. A php.Range binds as four integers.
 func exec(stmt *sqlite3.Stmt, args ...any) error {
 	i := 1
 	for _, a := range args {
@@ -334,8 +320,6 @@ func exec(stmt *sqlite3.Stmt, args ...any) error {
 			err = stmt.BindBlob(i, v)
 		case int64:
 			err = stmt.BindInt64(i, v)
-		case nil:
-			err = stmt.BindNull(i)
 		case php.Range:
 			err = errors.Join(stmt.BindInt(i, v.Start.Line), stmt.BindInt(i+1, v.Start.Character),
 				stmt.BindInt(i+2, v.End.Line), stmt.BindInt(i+3, v.End.Character))
