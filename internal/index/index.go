@@ -106,25 +106,29 @@ func (ix *Index) prepare(root string, logf func(string, ...any)) error {
 		return err
 	}
 	if complete {
-		same, err := ix.sameFiles(root, paths, logf)
+		same, n, err := ix.sameFiles(root, paths, logf)
 		if err != nil {
 			return err
 		}
 		if same {
-			logf("phplslow: index reused: %d files", len(paths))
+			logf("phplslow: index reused: %d files", n)
 			return nil
 		}
 	}
-	if err := ix.build(root, paths, logf); err != nil {
+	n, err := ix.build(root, paths, logf)
+	if err != nil {
 		return err
 	}
-	logf("phplslow: index built: %d files", len(paths))
+	logf("phplslow: index built: %d files", n)
 	return nil
 }
 
 // phpFiles lists the .php files under root, relative, with forward slashes, sorted. Symlinks are followed, to files
 // and to directories, also outside root; a file is named by its path through the symlink. A directory that is
 // already on the way from root to it is not walked again. Only regular files are listed.
+//
+// An entry that cannot be walked is an error: the list would miss files without saying so. Only a broken symlink
+// whose name does not end in .php is skipped: what it pointed at, a file or a directory, cannot be known.
 func phpFiles(root string, logf func(string, ...any)) ([]string, error) {
 	canonical, err := filepath.EvalSymlinks(root)
 	if err != nil {
@@ -135,31 +139,36 @@ func phpFiles(root string, logf func(string, ...any)) ([]string, error) {
 		return nil, err
 	}
 	var paths []string
-	walkDir(root, "", entries, []string{canonical}, &paths, logf)
+	if err := walkDir(root, "", entries, []string{canonical}, &paths, logf); err != nil {
+		return nil, err
+	}
 	slices.Sort(paths)
 	return paths, nil
 }
 
 // walkDir lists the .php files of the directory dir, whose path relative to the root is rel; chain holds the
 // canonical paths of the directories from the root to dir.
-func walkDir(dir, rel string, entries []fs.DirEntry, chain []string, paths *[]string, logf func(string, ...any)) {
+func walkDir(dir, rel string, entries []fs.DirEntry, chain []string, paths *[]string, logf func(string, ...any)) error {
 	for _, e := range entries {
 		p, r := filepath.Join(dir, e.Name()), path.Join(rel, e.Name())
 		mode := e.Type()
 		if mode&fs.ModeSymlink != 0 {
 			info, err := os.Stat(p) // never opens the target: a named pipe does not block it
-			if err != nil {
+			switch {
+			case err == nil:
+				mode = info.Mode().Type()
+			case broken(err) && !strings.HasSuffix(e.Name(), ".php"):
 				logf("phplslow: skip %s: %v", p, err)
 				continue
+			default:
+				return err
 			}
-			mode = info.Mode().Type()
 		}
 		switch {
 		case mode.IsDir():
 			canonical, err := filepath.EvalSymlinks(p)
 			if err != nil {
-				logf("phplslow: skip %s: %v", p, err)
-				continue
+				return err
 			}
 			if slices.Contains(chain, canonical) {
 				logf("phplslow: skip %s: a symlink cycle", p)
@@ -167,18 +176,29 @@ func walkDir(dir, rel string, entries []fs.DirEntry, chain []string, paths *[]st
 			}
 			sub, err := os.ReadDir(p)
 			if err != nil {
-				logf("phplslow: skip %s: %v", p, err)
-				continue
+				return err
 			}
-			walkDir(p, r, sub, append(chain[:len(chain):len(chain)], canonical), paths, logf)
+			if err := walkDir(p, r, sub, append(chain[:len(chain):len(chain)], canonical), paths, logf); err != nil {
+				return err
+			}
 		case mode.IsRegular() && strings.HasSuffix(e.Name(), ".php"):
 			*paths = append(*paths, r)
 		}
 	}
+	return nil
 }
 
+// broken reports whether err, from following a symlink, says that the symlink leads nowhere: its target does not
+// exist or the chain of symlinks does not end.
+func broken(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.ELOOP)
+}
+
+// errNotRegular is the error of reading a name that is not a regular file.
+var errNotRegular = errors.New("not a regular file")
+
 // readFile reads a regular file. The file is opened without blocking and checked after opening, so a name that
-// has become a named pipe, a socket or a device by then is not read.
+// has become a named pipe, a socket or a device by then is not read: the error is errNotRegular.
 func readFile(name string) ([]byte, error) {
 	f, err := os.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -190,20 +210,24 @@ func readFile(name string) ([]byte, error) {
 		return nil, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s: not a regular file", name)
+		return nil, fmt.Errorf("%s: %w", name, errNotRegular)
 	}
 	return io.ReadAll(f)
 }
 
-// snapshotFile reads the file p of the Workspace, relative to root, and hashes it for the snapshot. A file that
-// cannot be read is logged and is not part of the snapshot: ok is false.
-func snapshotFile(root, p string, logf func(string, ...any)) (src []byte, sum [sha256.Size]byte, ok bool) {
-	src, err := readFile(filepath.Join(root, filepath.FromSlash(p)))
-	if err != nil {
+// snapshotFile reads the file p of the Workspace, relative to root, and hashes it for the snapshot. A name that is
+// no longer a regular file is logged and is not part of the snapshot: ok is false. Any other error is returned:
+// the snapshot cannot be known without the file.
+func snapshotFile(root, p string, logf func(string, ...any)) (src []byte, sum [sha256.Size]byte, ok bool, err error) {
+	src, err = readFile(filepath.Join(root, filepath.FromSlash(p)))
+	if errors.Is(err, errNotRegular) {
 		logf("phplslow: skip %s: %v", p, err)
-		return nil, sum, false
+		return nil, sum, false, nil
 	}
-	return src, sha256.Sum256(src), true
+	if err != nil {
+		return nil, sum, false, err
+	}
+	return src, sha256.Sum256(src), true, nil
 }
 
 func (ix *Index) complete() (bool, error) {
@@ -216,39 +240,43 @@ func (ix *Index) complete() (bool, error) {
 	return found, stmt.Err()
 }
 
-// sameFiles reports whether the stored snapshot equals the files on disk. A file that cannot be read is not part
-// of the snapshot.
-func (ix *Index) sameFiles(root string, paths []string, logf func(string, ...any)) (bool, error) {
+// sameFiles reports whether the stored snapshot equals the files on disk and how many files it holds. A file that
+// cannot be read is an error, never a match.
+func (ix *Index) sameFiles(root string, paths []string, logf func(string, ...any)) (bool, int, error) {
 	stored := map[string]string{}
 	stmt, _, err := ix.conn.Prepare(`SELECT path, hex(hash) FROM files`)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	for stmt.Step() {
 		stored[stmt.ColumnText(0)] = strings.ToLower(stmt.ColumnText(1))
 	}
 	if err := errors.Join(stmt.Err(), stmt.Close()); err != nil {
-		return false, err
+		return false, 0, err
 	}
 	read := 0
 	for _, p := range paths {
-		_, sum, ok := snapshotFile(root, p, logf)
+		_, sum, ok, err := snapshotFile(root, p, logf)
+		if err != nil {
+			return false, 0, err
+		}
 		if !ok {
 			continue
 		}
 		read++
 		if stored[p] != hex.EncodeToString(sum[:]) {
-			return false, nil
+			return false, 0, nil
 		}
 	}
-	return read == len(stored), nil
+	return read == len(stored), read, nil
 }
 
-// build replaces the whole index in one transaction: a build that does not finish leaves the previous state.
-func (ix *Index) build(root string, paths []string, logf func(string, ...any)) (err error) {
+// build replaces the whole index in one transaction and returns the number of files indexed. A build that does
+// not finish, also on a file that cannot be read, leaves the previous state.
+func (ix *Index) build(root string, paths []string, logf func(string, ...any)) (n int, err error) {
 	tx, err := ix.conn.BeginImmediate()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.End(&err)
 
@@ -256,32 +284,36 @@ func (ix *Index) build(root string, paths []string, logf func(string, ...any)) (
 		DELETE FROM meta; DELETE FROM files; DELETE FROM symbols; DELETE FROM links;
 		CREATE TEMP TABLE calls (key TEXT NOT NULL, file INTEGER NOT NULL,
 			sl INTEGER NOT NULL, sc INTEGER NOT NULL, el INTEGER NOT NULL, ec INTEGER NOT NULL);`); err != nil {
-		return err
+		return 0, err
 	}
 	insFile, _, err := ix.conn.Prepare(`INSERT INTO files (path, hash) VALUES (?, ?)`)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer insFile.Close()
 	insSymbol, _, err := ix.conn.Prepare(`INSERT INTO symbols (key, file, sl, sc, el, ec) VALUES (?, ?, ?, ?, ?, ?)`)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer insSymbol.Close()
 	insCall, _, err := ix.conn.Prepare(
 		`INSERT INTO temp.calls (key, file, sl, sc, el, ec) VALUES (?, ?, ?, ?, ?, ?)`)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer insCall.Close()
 
 	for _, p := range paths {
-		src, sum, ok := snapshotFile(root, p, logf)
+		src, sum, ok, err := snapshotFile(root, p, logf)
+		if err != nil {
+			return 0, err
+		}
 		if !ok {
 			continue
 		}
+		n++
 		if err := exec(insFile, p, sum[:]); err != nil {
-			return fmt.Errorf("%s: %w", p, err)
+			return 0, fmt.Errorf("%s: %w", p, err)
 		}
 		file := ix.conn.LastInsertRowID()
 		facts, syntax := php.Parse(src)
@@ -290,17 +322,17 @@ func (ix *Index) build(root string, paths []string, logf func(string, ...any)) (
 		}
 		for _, m := range facts.Methods {
 			if err := exec(insSymbol, m.Key, file, m.Name); err != nil {
-				return fmt.Errorf("%s: %w", p, err)
+				return 0, fmt.Errorf("%s: %w", p, err)
 			}
 		}
 		for _, c := range facts.Calls {
 			if err := exec(insCall, c.Key, file, c.Name); err != nil {
-				return fmt.Errorf("%s: %w", p, err)
+				return 0, fmt.Errorf("%s: %w", p, err)
 			}
 		}
 	}
 	// A call becomes a link only when its target Symbol is declared somewhere in the Workspace.
-	return ix.conn.Exec(`
+	return n, ix.conn.Exec(`
 		INSERT INTO links (key, file, sl, sc, el, ec)
 			SELECT key, file, sl, sc, el, ec FROM temp.calls c
 			WHERE EXISTS (SELECT 1 FROM symbols s WHERE s.key = c.key);

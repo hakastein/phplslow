@@ -6,6 +6,21 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// knownScopeCalls is every call in testdata/scopes whose receiver class is known to be Shop\Cart.
+var knownScopeCalls = []place{
+	{"src/top.php", "add('top-level-new')"},
+	{"src/top.php", "add('closure-own')"},
+	{"src/top.php", "add('function-body')"},
+	{"src/top.php", "add('function-new')"},
+	{"src/top.php", "add('function-arrow')"},
+	{"src/top.php", "add('function-closure')"},
+	{"src/top.php", "add('nested-arrows')"},
+	{"src/top.php", "add('closure-in-arrow')"},
+	{"src/top.php", "add('method-body')"},
+	{"src/superglobals.php", "add('local-session')"},
+	{"src/superglobals.php", "add('lower-case-session')"},
+}
+
 // A variable's class is known only inside a function, method or closure body, from the writes in that body: any
 // file may reach a top-level variable, and any function a superglobal.
 func TestReceiverScopes(t *testing.T) {
@@ -22,10 +37,17 @@ func TestReceiverScopes(t *testing.T) {
 		{"new at top level", place{"src/top.php", "add('top-level-new')"}, []place{cartAdd}},
 		{"top-level variable in an arrow function", place{"src/top.php", "add('top-level-arrow')"}, nil},
 		{"top-level variable imported by a closure", place{"src/top.php", "add('top-level-closure')"}, nil},
+		{"top-level variable through nested arrow functions", place{"src/top.php", "add('top-level-nested')"}, nil},
+		{"closure's own variable at top level", place{"src/top.php", "add('closure-own')"}, []place{cartAdd}},
 		{"variable of a function body", place{"src/top.php", "add('function-body')"}, []place{cartAdd}},
 		{"new in a function body", place{"src/top.php", "add('function-new')"}, []place{cartAdd}},
 		{"function variable in an arrow function", place{"src/top.php", "add('function-arrow')"}, []place{cartAdd}},
 		{"function variable imported by a closure", place{"src/top.php", "add('function-closure')"}, []place{cartAdd}},
+		{"function variable through nested arrow functions", place{"src/top.php", "add('nested-arrows')"},
+			[]place{cartAdd}},
+		{"function variable imported by a closure in an arrow function", place{"src/top.php", "add('closure-in-arrow')"},
+			[]place{cartAdd}},
+		{"variable of a method body", place{"src/top.php", "add('method-body')"}, []place{cartAdd}},
 		{"alias made by another file", place{"src/aliased.php", "add('alias-from-another-file')"}, nil},
 		{"global in eval", place{"src/evaluated.php", "add('global-in-eval')"}, nil},
 		{"global in a non-.php file", place{"src/included.php", "add('global-in-a-non-php-file')"}, nil},
@@ -46,5 +68,8 @@ func TestReceiverScopes(t *testing.T) {
 			assert.ElementsMatch(t, locations(t, root, tt.want), definition(c, root, tt.at))
 		})
 	}
+	t.Run("references from the declaration", func(t *testing.T) {
+		assert.ElementsMatch(t, locations(t, root, knownScopeCalls), references(c, root, cartAdd, false))
+	})
 	c.stop()
 }
