@@ -40,7 +40,11 @@ func TestMain(m *testing.M) {
 	build.Stdout, build.Stderr = os.Stderr, os.Stderr
 	code := 1
 	if err := build.Run(); err == nil {
-		code = m.Run()
+		if indexDir, err = parserIndexDir(binary); err == nil {
+			code = m.Run()
+		} else {
+			fmt.Fprintln(os.Stderr, err)
+		}
 	}
 	os.RemoveAll(dir)
 	os.Exit(code)
@@ -70,7 +74,29 @@ func indexFile(home, root string) string {
 		dir = filepath.Join(home, "Library", "Caches")
 	}
 	sum := sha256.Sum256([]byte(root))
-	return filepath.Join(dir, "phplslow", "index-v2", hex.EncodeToString(sum[:16]), "index.sqlite")
+	return filepath.Join(dir, "phplslow", indexDir, hex.EncodeToString(sum[:16]), "index.sqlite")
+}
+
+// indexDir is the directory ADR 0001 names for the indexes of the test binary: the schema version and the parser
+// module the binary is linked with, or the binary file itself when that parser is a local directory.
+var indexDir string
+
+// parserIndexDir computes indexDir for the binary at bin.
+func parserIndexDir(bin string) (string, error) {
+	out, err := exec.Command("go", "list", "-m", "-f",
+		"{{with .Replace}}{{.Path}}@{{.Version}}{{else}}{{.Path}}@{{.Version}}{{end}}",
+		"github.com/VKCOM/php-parser").Output()
+	if err != nil {
+		return "", fmt.Errorf("go list the parser module: %w", err)
+	}
+	id := bytes.TrimSpace(out)
+	if bytes.HasSuffix(id, []byte("@")) {
+		if id, err = os.ReadFile(bin); err != nil {
+			return "", err
+		}
+	}
+	sum := sha256.Sum256(id)
+	return "index-v2-" + hex.EncodeToString(sum[:6]), nil
 }
 
 // lockIndex holds an exclusive lock on the index file of root for processes with home as their cache directory:
@@ -140,7 +166,13 @@ func (b *syncBuffer) String() string {
 // start runs phplslow with home as the user's home and cache directory.
 func start(t *testing.T, home string) *client {
 	t.Helper()
-	cmd := exec.Command(binary)
+	return startBinary(t, binary, home)
+}
+
+// startBinary runs the phplslow binary at path like start.
+func startBinary(t *testing.T, path, home string) *client {
+	t.Helper()
+	cmd := exec.Command(path)
 	cmd.Env = append(os.Environ(), "HOME="+home, "XDG_CACHE_HOME="+home, "LOCALAPPDATA="+home)
 	stdin, err := cmd.StdinPipe()
 	require.NoError(t, err)

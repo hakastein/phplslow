@@ -2,4 +2,12 @@
 
 namespace Shop;
 
-enum Suit: string { case H = 'h'; }
+enum Suit: string
+{
+    case H = 'h';
+
+    public function color(): string
+    {
+        return 'red';
+    }
+}

@@ -12,6 +12,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -25,6 +27,61 @@ import (
 // schemaDir names the schema and the link semantics of the index. An incompatible change of either gets a new name,
 // so an index of another schema or with links resolved by other rules is never opened.
 const schemaDir = "index-v2"
+
+// parserModule is the module of the PHP parser; the binary may be linked with a module that replaces it.
+const parserModule = "github.com/VKCOM/php-parser"
+
+// indexDir is the directory of every index this binary builds: schemaDir and the parser module the binary is linked
+// with. An index whose facts another parser extracted has the same snapshot of files, so it lives elsewhere and is
+// never opened. A parser from a local directory has no version; the binary file itself names it then.
+func indexDir() (string, error) {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "", errors.New("index: the binary carries no module information")
+	}
+	for _, dep := range info.Deps {
+		if dep.Path != parserModule {
+			continue
+		}
+		if dep.Replace != nil {
+			dep = dep.Replace
+		}
+		sum := sha256.Sum256([]byte(dep.Path + "@" + dep.Version))
+		if dep.Version == "" || dep.Version == "(devel)" {
+			var err error
+			if sum, err = executableSum(); err != nil {
+				return "", err
+			}
+		}
+		return schemaDir + "-" + hex.EncodeToString(sum[:6]), nil
+	}
+	return "", fmt.Errorf("index: the binary carries no version of %s", parserModule)
+}
+
+// executableSum is the sha256 of the running binary. On Linux it reads /proc/self/exe, the file the process runs even
+// when another file has replaced it at its path since; elsewhere it reads the file at the path the process started
+// from.
+func executableSum() ([sha256.Size]byte, error) {
+	var sum [sha256.Size]byte
+	exe := "/proc/self/exe"
+	if runtime.GOOS != "linux" {
+		var err error
+		if exe, err = os.Executable(); err != nil {
+			return sum, err
+		}
+	}
+	f, err := os.Open(exe)
+	if err != nil {
+		return sum, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return sum, err
+	}
+	copy(sum[:], h.Sum(nil))
+	return sum, nil
+}
 
 const schema = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
@@ -59,8 +116,12 @@ func indexPath(root string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	dir, err := indexDir()
+	if err != nil {
+		return "", err
+	}
 	sum := sha256.Sum256([]byte(root))
-	return filepath.Join(cache, "phplslow", schemaDir, hex.EncodeToString(sum[:16]), "index.sqlite"), nil
+	return filepath.Join(cache, "phplslow", dir, hex.EncodeToString(sum[:16]), "index.sqlite"), nil
 }
 
 // Open opens the index of root and makes it describe the files under root. An index whose snapshot of files
