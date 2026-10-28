@@ -14,3 +14,5 @@ require (
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 )
+
+replace github.com/VKCOM/php-parser => github.com/hakastein/php-parser v0.8.3-0.20261019132731-b976bc1bafe4
