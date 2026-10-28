@@ -32,7 +32,7 @@ const parserModule = "github.com/VKCOM/php-parser"
 
 // indexDir is the directory of every index this binary builds: schemaDir and the parser module the binary is linked
 // with. An index whose facts another parser extracted has the same snapshot of files, so it lives elsewhere and is
-// never opened.
+// never opened. A parser from a local directory has no version; the binary file itself names it then.
 func indexDir() (string, error) {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
@@ -46,9 +46,35 @@ func indexDir() (string, error) {
 			dep = dep.Replace
 		}
 		sum := sha256.Sum256([]byte(dep.Path + "@" + dep.Version))
+		if dep.Version == "" || dep.Version == "(devel)" {
+			var err error
+			if sum, err = executableSum(); err != nil {
+				return "", err
+			}
+		}
 		return schemaDir + "-" + hex.EncodeToString(sum[:6]), nil
 	}
 	return "", fmt.Errorf("index: the binary carries no version of %s", parserModule)
+}
+
+// executableSum is the sha256 of the running binary's file.
+func executableSum() ([sha256.Size]byte, error) {
+	var sum [sha256.Size]byte
+	exe, err := os.Executable()
+	if err != nil {
+		return sum, err
+	}
+	f, err := os.Open(exe)
+	if err != nil {
+		return sum, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return sum, err
+	}
+	copy(sum[:], h.Sum(nil))
+	return sum, nil
 }
 
 const schema = `

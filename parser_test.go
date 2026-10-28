@@ -36,21 +36,34 @@ func upstreamParserBinary(t *testing.T) string {
 }
 
 // An index built with another parser holds the facts that parser extracted; the snapshot of files alone cannot tell.
+// Each binary builds its own index whichever ran first, and answers by the facts of its own parser.
 func TestIndexOfAnotherParserIsNotReused(t *testing.T) {
-	root, home := workspace(t, "syntax"), cache(t)
+	upstream := upstreamParserBinary(t)
 
-	upstream := startBinary(t, upstreamParserBinary(t), home)
-	upstream.initialize(root)
-	upstreamReferences := references(upstream, root, enumLabel, false)
-	upstream.stop()
+	tests := []struct {
+		name          string
+		first, second string
+		want          []place
+	}{
+		{"fork after upstream", upstream, binary, []place{enumCall}},
+		{"upstream after fork, which loses the class named Enum", binary, upstream, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root, home := workspace(t, "syntax"), cache(t)
+			first := startBinary(t, tt.first, home)
+			first.initialize(root)
+			references(first, root, enumLabel, false)
+			first.stop()
 
-	fork := start(t, home)
-	fork.initialize(root)
-	forkReferences := references(fork, root, enumLabel, false)
-	fork.stop()
+			second := startBinary(t, tt.second, home)
+			second.initialize(root)
+			got := references(second, root, enumLabel, false)
+			second.stop()
 
-	assert.Empty(t, upstreamReferences, "the upstream parser loses the class named Enum")
-	assert.ElementsMatch(t, locations(t, root, []place{enumCall}), forkReferences)
-	assert.Contains(t, fork.stderr.String(), built)
-	assert.NotContains(t, fork.stderr.String(), reused)
+			assert.ElementsMatch(t, locations(t, root, tt.want), got)
+			assert.Contains(t, second.stderr.String(), built)
+			assert.NotContains(t, second.stderr.String(), reused)
+		})
+	}
 }

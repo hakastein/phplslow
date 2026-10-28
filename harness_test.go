@@ -40,7 +40,11 @@ func TestMain(m *testing.M) {
 	build.Stdout, build.Stderr = os.Stderr, os.Stderr
 	code := 1
 	if err := build.Run(); err == nil {
-		code = m.Run()
+		if indexDir, err = parserIndexDir(binary); err == nil {
+			code = m.Run()
+		} else {
+			fmt.Fprintln(os.Stderr, err)
+		}
 	}
 	os.RemoveAll(dir)
 	os.Exit(code)
@@ -74,17 +78,26 @@ func indexFile(home, root string) string {
 }
 
 // indexDir is the directory ADR 0001 names for the indexes of the test binary: the schema version and the parser
-// module the binary is linked with.
-var indexDir = func() string {
+// module the binary is linked with, or the binary file itself when that parser is a local directory.
+var indexDir string
+
+// parserIndexDir computes indexDir for the binary at bin.
+func parserIndexDir(bin string) (string, error) {
 	out, err := exec.Command("go", "list", "-m", "-f",
 		"{{with .Replace}}{{.Path}}@{{.Version}}{{else}}{{.Path}}@{{.Version}}{{end}}",
 		"github.com/VKCOM/php-parser").Output()
 	if err != nil {
-		panic(fmt.Sprintf("go list the parser module: %v", err))
+		return "", fmt.Errorf("go list the parser module: %w", err)
 	}
-	sum := sha256.Sum256(bytes.TrimSpace(out))
-	return "index-v2-" + hex.EncodeToString(sum[:6])
-}()
+	id := bytes.TrimSpace(out)
+	if bytes.HasSuffix(id, []byte("@")) {
+		if id, err = os.ReadFile(bin); err != nil {
+			return "", err
+		}
+	}
+	sum := sha256.Sum256(id)
+	return "index-v2-" + hex.EncodeToString(sum[:6]), nil
+}
 
 // lockIndex holds an exclusive lock on the index file of root for processes with home as their cache directory:
 // such a process can neither read nor build that index until the returned func releases the lock.
