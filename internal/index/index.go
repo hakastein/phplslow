@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -57,12 +58,17 @@ func indexDir() (string, error) {
 	return "", fmt.Errorf("index: the binary carries no version of %s", parserModule)
 }
 
-// executableSum is the sha256 of the running binary's file.
+// executableSum is the sha256 of the running binary. On Linux it reads /proc/self/exe, the file the process runs even
+// when another file has replaced it at its path since; elsewhere it reads the file at the path the process started
+// from.
 func executableSum() ([sha256.Size]byte, error) {
 	var sum [sha256.Size]byte
-	exe, err := os.Executable()
-	if err != nil {
-		return sum, err
+	exe := "/proc/self/exe"
+	if runtime.GOOS != "linux" {
+		var err error
+		if exe, err = os.Executable(); err != nil {
+			return sum, err
+		}
 	}
 	f, err := os.Open(exe)
 	if err != nil {
